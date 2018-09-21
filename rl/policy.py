@@ -117,26 +117,6 @@ class LinearAnnealedPolicy(Policy):
         config['inner_policy'] = get_object_config(self.inner_policy)
         return config
 
-class SoftmaxPolicy(Policy):
-    """ Implement softmax policy for multinimial distribution
-
-    Simple Policy
-
-    - takes action according to the pobability distribution
-
-    """
-    def select_action(self, nb_actions, probs):
-        """Return the selected action
-
-        # Arguments
-            probs (np.ndarray) : Probabilty for each action
-        
-        # Returns
-            action
-
-        """
-        action = np.random.choice(range(nb_actions), p=probs)
-        return action
 
 class EpsGreedyQPolicy(Policy):
     """Implement the epsilon greedy policy
@@ -146,11 +126,12 @@ class EpsGreedyQPolicy(Policy):
     - takes a random action with probability epsilon
     - takes current best action with prob (1 - epsilon)
     """
-    def __init__(self, eps=.1):
+    def __init__(self, eps=.1, masked_greedy=False):
         super(EpsGreedyQPolicy, self).__init__()
         self.eps = eps
+        self.masked_greedy = masked_greedy
 
-    def select_action(self, q_values):
+    def select_action(self, q_values, legal_actions):
         """Return the selected action
 
         # Arguments
@@ -163,9 +144,18 @@ class EpsGreedyQPolicy(Policy):
         nb_actions = q_values.shape[0]
 
         if np.random.uniform() < self.eps:
-            action = np.random.random_integers(0, nb_actions-1)
+            if legal_actions is None:
+                action = np.random.random_integers(0, nb_actions-1)
+            else:
+                action = int(np.random.choice(legal_actions,1)[0])
         else:
-            action = np.argmax(q_values)
+            if legal_actions is None or not self.masked_greedy:
+                action = np.argmax(q_values)
+            else:
+                for action in range(nb_actions):
+                    if action not in legal_actions:
+                        q_values[action] = -100000
+                action = np.argmax(q_values)
         return action
 
     def get_config(self):
@@ -184,7 +174,12 @@ class GreedyQPolicy(Policy):
 
     Greedy policy returns the current best action according to q_values
     """
-    def select_action(self, q_values):
+
+    def __init__(self, eps=.1, masked_greedy=False):
+        super(GreedyQPolicy, self).__init__()
+        self.masked_greedy = masked_greedy
+
+    def select_action(self, q_values, legal_actions):
         """Return the selected action
 
         # Arguments
@@ -194,7 +189,16 @@ class GreedyQPolicy(Policy):
             Selection action
         """
         assert q_values.ndim == 1
-        action = np.argmax(q_values)
+        nb_actions = q_values.shape[0]
+        
+        if legal_actions is None or not self.masked_greedy:
+                action = np.argmax(q_values)
+        else:
+            for action in range(nb_actions):
+                if action not in legal_actions:
+                    q_values[action] = -100000
+            action = np.argmax(q_values)
+
         return action
 
 

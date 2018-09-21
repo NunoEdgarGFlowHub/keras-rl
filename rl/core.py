@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
 import warnings
 from copy import deepcopy
+from collections import deque
+import os
 
 import numpy as np
 from keras.callbacks import History
+import pickle
 
 from rl.callbacks import (
     CallbackList,
     TestLogger,
     TrainEpisodeLogger,
     TrainIntervalLogger,
-    Visualizer
+    Visualizer,
+    FileLogger
 )
 
 
@@ -52,7 +56,9 @@ class Agent(object):
 
     def fit(self, env, nb_steps, action_repetition=1, callbacks=None, verbose=1,
             visualize=False, nb_max_start_steps=0, start_step_policy=None, log_interval=10000,
-            nb_max_episode_steps=None):
+            nb_max_episode_steps=None, episode_averaging_length=10, success_threshold=None,
+            stopping_patience=None, min_nb_steps=500, single_cycle=True):
+
         """Trains the agent on the given environment.
 
         # Arguments
@@ -90,10 +96,16 @@ class Agent(object):
 
         callbacks = [] if not callbacks else callbacks[:]
 
+        for cb in callbacks:
+            if isinstance(cb, FileLogger):
+                save_path = cb.filepath
+                folder_index = save_path.index("training_history.json")
+                weights_file = os.path.join(save_path[:folder_index],"dqn_weights.h5f")
+
         if verbose == 1:
             callbacks += [TrainIntervalLogger(interval=log_interval)]
         elif verbose > 1:
-            callbacks += [TrainEpisodeLogger()]
+            callbacks += [TrainEpisodeLogger(interval=log_interval)]
         if visualize:
             callbacks += [Visualizer()]
         history = History()
@@ -119,17 +131,55 @@ class Agent(object):
         observation = None
         episode_reward = None
         episode_step = None
+        episode_num_errors = None
         did_abort = False
+
+        # ------ Early stopping and reporting averages ------------------
+        #
+        # It would be ideal to do this via a callback, but returning flags from callbacks seems tricky. Eish!
+        # So, we automatically include early stopping here in the fit method.
+        # NB: We have hardcoded in something which is probably not ideal to hard code, but I just want it
+        # to work, and can fix things and make them nicer/more flexible at a later stage!
+        #
+        # --------------------------------------------------------------
+
+        if not single_cycle:
+
+            recent_episode_lifetimes = deque([], episode_averaging_length)
+            episode_lifetimes_rolling_avg = 0
+            best_rolling_avg = 0
+            best_episode = 0
+            time_since_best = 0
+
+
+        elif single_cycle:
+
+            recent_episode_wins = deque([], episode_averaging_length)
+            best_rolling_avg = 0
+            best_episode = 0
+            time_since_best = 0
+            rolling_win_fraction = 0
+
+        stop_training = False
+        has_succeeded = False
+        stopped_improving = False
+
         try:
-            while self.step < nb_steps:
+            while self.step < nb_steps and not stop_training:
                 if observation is None:  # start of a new episode
                     callbacks.on_episode_begin(episode)
                     episode_step = np.int16(0)
                     episode_reward = np.float32(0)
 
+
                     # Obtain the initial observation by resetting the environment.
                     self.reset_states()
                     observation = deepcopy(env.reset())
+                    # print("Episode Step:", episode_step)
+                    # print("hidden state: ")
+                    # print(env.hidden_state)
+                    # print("Board State: ")
+                    # print(observation)
                     if self.processor is not None:
                         observation = self.processor.process_observation(observation)
                     assert observation is not None
@@ -162,11 +212,18 @@ class Agent(object):
                 assert episode_step is not None
                 assert observation is not None
 
+                # print("Episode Step:", episode_step)
                 # Run a single step.
                 callbacks.on_step_begin(episode_step)
                 # This is were all of the work happens. We first perceive and compute the action
                 # (forward step) and then use the reward to improve (backward step).
-                action = self.forward(observation)
+                if hasattr(env, "legal_actions"):
+                    legal_actions = list(env.legal_actions)
+                    action = self.forward(observation, legal_actions)
+                    # print("legal actions: ", legal_actions)
+                    # print("chosen action: ", action)
+                else:
+                    action = self.forward(observation)
                 if self.processor is not None:
                     action = self.processor.process_action(action)
                 reward = np.float32(0)
@@ -194,6 +251,13 @@ class Agent(object):
                 metrics = self.backward(reward, terminal=done)
                 episode_reward += reward
 
+                # print("new hidden state: ")
+                # print(env.hidden_state)
+                # print("new board state: ")
+                # print(observation)
+                # print("reward: ", r, "episode reward: ", episode_reward)
+                # print("done: ", done)
+
                 step_logs = {
                     'action': action,
                     'observation': observation,
@@ -212,33 +276,128 @@ class Agent(object):
                     # resetting the environment. We need to pass in `terminal=False` here since
                     # the *next* state, that is the state of the newly reset environment, is
                     # always non-terminal by convention.
-                    self.forward(observation)
+
+                    action = self.forward(observation)
                     self.backward(0., terminal=False)
 
+                    # Now we want to work out the recent averages, this will go into early stopping
+
+                    if not single_cycle:
+
+                        recent_episode_lifetimes.append(env.lifetime)
+                        episode_lifetimes_rolling_avg = np.mean(recent_episode_lifetimes)
+
+                        if episode_lifetimes_rolling_avg > best_rolling_avg:
+                            best_rolling_avg = episode_lifetimes_rolling_avg
+                            best_episode = episode
+                            time_since_best = 0
+                        else:
+                            time_since_best = episode - best_episode
+
+                        if episode_lifetimes_rolling_avg > success_threshold:
+                            stop_training = True
+                            has_succeeded = True
+
+                        if self.step > min_nb_steps and time_since_best > stopping_patience:
+                            stop_training = True
+                            stopped_improving = True
+
+                    else:
+
+                        if episode_reward == 1:
+                            recent_episode_wins.append(1)
+                        else:
+                            recent_episode_wins.append(0)
+
+                        num_wins = np.sum(recent_episode_wins)
+                        rolling_win_fraction = num_wins/episode_averaging_length
+
+                        if rolling_win_fraction > best_rolling_avg:
+                            best_rolling_avg = rolling_win_fraction
+                            best_episode = episode
+                            time_since_best = 0
+                            
+                            # Here I need to add something to save the net - I'm worried this will make things really slow while its improving, because it will be saving every time
+                            # For a long time. Eish!
+                            if self.step > min_nb_steps:
+                                self.save_weights(weights_file, overwrite=True)
+
+                        else:
+                            time_since_best = episode - best_episode
+
+                        if rolling_win_fraction > success_threshold:
+                            stop_training = True
+                            has_succeeded = True
+
+                        if self.step > min_nb_steps and time_since_best > stopping_patience:
+                            stop_training = True
+                            stopped_improving = True
+
+
                     # This episode is finished, report and reset.
-                    episode_logs = {
-                        'episode_reward': episode_reward,
-                        'nb_episode_steps': episode_step,
-                        'nb_steps': self.step,
-                    }
-                    callbacks.on_episode_end(episode, episode_logs)
+
+                    if not single_cycle:
+                        episode_logs = {
+                            'episode_reward': episode_reward,
+                            'nb_episode_steps': episode_step,
+                            'nb_steps': self.step,
+                            'episode_lifetimes_rolling_avg': episode_lifetimes_rolling_avg,
+                            'best_rolling_avg': best_rolling_avg,
+                            'best_episode': best_episode,
+                            'time_since_best': time_since_best,
+                            'has_succeeded': has_succeeded,
+                            'stopped_improving': stopped_improving
+                        }
+
+                    else:
+                        episode_logs = {
+                            'episode_reward': episode_reward,
+                            'nb_episode_steps': episode_step,
+                            'nb_steps': self.step,
+                            'rolling_win_fraction': rolling_win_fraction,
+                            'best_rolling_fraction': best_rolling_avg,
+                            'best_episode': best_episode,
+                            'time_since_best': time_since_best,
+                            'has_succeeded': has_succeeded,
+                            'stopped_improving': stopped_improving
+                        }
+
+                    callbacks.on_episode_end(episode, episode_logs, single_cycle)
 
                     episode += 1
                     observation = None
                     episode_step = None
                     episode_reward = None
+
         except KeyboardInterrupt:
             # We catch keyboard interrupts here so that training can be be safely aborted.
             # This is so common that we've built this right into this function, which ensures that
             # the `on_train_end` method is properly called.
             did_abort = True
-        callbacks.on_train_end(logs={'did_abort': did_abort})
+
+        if not single_cycle:
+            callbacks.on_train_end(logs={'did_abort': did_abort,
+                                         'has_succeeded': has_succeeded,
+                                         'stopped_improving': stopped_improving,
+                                         'episode_lifetimes_rolling_avg': episode_lifetimes_rolling_avg,
+                                         'step': self.step
+                                         }, single_cycle=single_cycle)
+
+        else:
+            callbacks.on_train_end(logs={'did_abort': did_abort,
+                             'has_succeeded': has_succeeded,
+                             'stopped_improving': stopped_improving,
+                             'rolling_win_fraction': rolling_win_fraction,
+                             'step': self.step
+                             }, single_cycle=single_cycle)
+
         self._on_train_end()
 
         return history
 
     def test(self, env, nb_episodes=1, action_repetition=1, callbacks=None, visualize=True,
-             nb_max_episode_steps=None, nb_max_start_steps=0, start_step_policy=None, verbose=1):
+             nb_max_episode_steps=None, nb_max_start_steps=0, start_step_policy=None, verbose=1,
+             episode_averaging_length=200, interval = 100, single_cycle=True):
         """Callback that is called before training begins.
 
         # Arguments
@@ -278,7 +437,7 @@ class Agent(object):
         callbacks = [] if not callbacks else callbacks[:]
 
         if verbose >= 1:
-            callbacks += [TestLogger()]
+            callbacks += [TestLogger(interval=interval)]
         if visualize:
             callbacks += [Visualizer()]
         history = History()
@@ -299,14 +458,38 @@ class Agent(object):
 
         self._on_test_begin()
         callbacks.on_train_begin()
+
+        if not single_cycle:
+
+            recent_episode_lifetimes = []
+            episode_lifetimes_rolling_avg = 0
+            best_rolling_avg = 0
+            best_episode = 0
+            time_since_best = 0
+
+        else:
+
+            recent_episode_wins = []
+            best_rolling_avg = 0
+            best_episode = 0
+            time_since_best = 0
+            rolling_win_fraction = 0
+
+
+        stop_training = False
+        has_succeeded = False
+        stopped_improving = False
+
         for episode in range(nb_episodes):
             callbacks.on_episode_begin(episode)
             episode_reward = 0.
             episode_step = 0
 
+
             # Obtain the initial observation by resetting the environment.
             self.reset_states()
             observation = deepcopy(env.reset())
+
             if self.processor is not None:
                 observation = self.processor.process_observation(observation)
             assert observation is not None
@@ -339,7 +522,12 @@ class Agent(object):
             while not done:
                 callbacks.on_step_begin(episode_step)
 
-                action = self.forward(observation)
+                if hasattr(env, "legal_actions"):
+                    legal_actions = list(env.legal_actions)
+                    action = self.forward(observation, legal_actions)
+                else:
+                    action = self.forward(observation)
+
                 if self.processor is not None:
                     action = self.processor.process_action(action)
                 reward = 0.
@@ -366,6 +554,7 @@ class Agent(object):
                 self.backward(reward, terminal=done)
                 episode_reward += reward
 
+
                 step_logs = {
                     'action': action,
                     'observation': observation,
@@ -385,12 +574,35 @@ class Agent(object):
             self.forward(observation)
             self.backward(0., terminal=False)
 
-            # Report end of episode.
-            episode_logs = {
-                'episode_reward': episode_reward,
-                'nb_steps': episode_step,
-            }
-            callbacks.on_episode_end(episode, episode_logs)
+            if not single_cycle:
+                recent_episode_lifetimes.append(env.lifetime)
+                episode_lifetimes_rolling_avg = np.mean(recent_episode_lifetimes)
+
+            else:
+
+                if episode_reward == 1:
+                    recent_episode_wins.append(1)
+                else:
+                    recent_episode_wins.append(0)
+
+                num_wins = np.sum(recent_episode_wins)
+                rolling_win_fraction = num_wins/len(recent_episode_wins)
+
+            if not single_cycle:
+                episode_logs = {
+                    'episode_reward': episode_reward,
+                    'nb_episode_steps': episode_step,
+                    'episode_lifetimes_rolling_avg': episode_lifetimes_rolling_avg}
+
+            else:
+                episode_logs = {
+                    'episode_reward': episode_reward,
+                    'nb_episode_steps': episode_step,
+                    'rolling_win_fraction': rolling_win_fraction}
+
+            callbacks.on_episode_end(episode, episode_logs, single_cycle)
+        
+
         callbacks.on_train_end()
         self._on_test_end()
 

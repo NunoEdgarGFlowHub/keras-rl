@@ -66,7 +66,8 @@ class AbstractDQNAgent(Agent):
         return q_values
 
     def compute_q_values(self, state):
-        q_values = self.compute_batch_q_values([state]).flatten()
+        # state = np.expand_dims(state[0], 0)
+        q_values = self.compute_batch_q_values(state).flatten()
         assert q_values.shape == (self.nb_actions,)
         return q_values
 
@@ -100,7 +101,7 @@ class DQNAgent(AbstractDQNAgent):
             `naive`: Q(s,a;theta) = V(s;theta) + A(s,a;theta) 
  
     """
-    def __init__(self, model, policy=None, test_policy=None, enable_double_dqn=False, enable_dueling_network=False,
+    def __init__(self, model, policy=None, test_policy=None, enable_double_dqn=True, enable_dueling_network=False,
                  dueling_type='avg', *args, **kwargs):
         super(DQNAgent, self).__init__(*args, **kwargs)
 
@@ -130,9 +131,9 @@ class DQNAgent(AbstractDQNAgent):
             # dueling_type == 'naive'
             # Q(s,a;theta) = V(s;theta) + A(s,a;theta)
             if self.dueling_type == 'avg':
-                outputlayer = Lambda(lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:] - K.mean(a[:, 1:], axis=1, keepdims=True), output_shape=(nb_action,))(y)
+                outputlayer = Lambda(lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:] - K.mean(a[:, 1:], keepdims=True), output_shape=(nb_action,))(y)
             elif self.dueling_type == 'max':
-                outputlayer = Lambda(lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:] - K.max(a[:, 1:], axis=1, keepdims=True), output_shape=(nb_action,))(y)
+                outputlayer = Lambda(lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:] - K.max(a[:, 1:], keepdims=True), output_shape=(nb_action,))(y)
             elif self.dueling_type == 'naive':
                 outputlayer = Lambda(lambda a: K.expand_dims(a[:, 0], -1) + a[:, 1:], output_shape=(nb_action,))(y)
             else:
@@ -222,14 +223,14 @@ class DQNAgent(AbstractDQNAgent):
     def update_target_model_hard(self):
         self.target_model.set_weights(self.model.get_weights())
 
-    def forward(self, observation):
+    def forward(self, observation, legal_actions=None):
         # Select an action.
         state = self.memory.get_recent_state(observation)
         q_values = self.compute_q_values(state)
         if self.training:
-            action = self.policy.select_action(q_values=q_values)
+            action = self.policy.select_action(q_values=q_values, legal_actions=legal_actions)
         else:
-            action = self.test_policy.select_action(q_values=q_values)
+            action = self.test_policy.select_action(q_values=q_values, legal_actions=legal_actions)
 
         # Book-keeping.
         self.recent_observation = observation
@@ -261,8 +262,8 @@ class DQNAgent(AbstractDQNAgent):
             terminal1_batch = []
             state1_batch = []
             for e in experiences:
-                state0_batch.append(e.state0)
-                state1_batch.append(e.state1)
+                state0_batch.append(e.state0[0])
+                state1_batch.append(e.state1[0])
                 reward_batch.append(e.reward)
                 action_batch.append(e.action)
                 terminal1_batch.append(0. if e.terminal1 else 1.)
