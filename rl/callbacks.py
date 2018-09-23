@@ -128,14 +128,16 @@ class TestLogger(Callback):
                     'episode': episode + 1,
                     'episode_reward': logs['episode_reward'],
                     'episode_steps': logs['nb_episode_steps'],
+                    'episode_lifetime': logs['episode_lifetime'],
                     'episode_lifetimes_rolling_avg': logs["episode_lifetimes_rolling_avg"]}
 
                 template = """-----------------
 Episode: {episode}
 This Episode Length: {episode_steps}
 This Episode Reward: {episode_reward}
+This Episode Lifetime: {episode_lifetime}
 
-Rolling Lifetimes Avg: {episode_lifetimes_rolling_avg:.3f}
+Episode Lifetimes Avg: {episode_lifetimes_rolling_avg:.3f}
 """
             else:
 

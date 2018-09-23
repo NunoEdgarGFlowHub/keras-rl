@@ -592,6 +592,7 @@ class Agent(object):
                 episode_logs = {
                     'episode_reward': episode_reward,
                     'nb_episode_steps': episode_step,
+                    'episode_lifetime': env.lifetime,
                     'episode_lifetimes_rolling_avg': episode_lifetimes_rolling_avg}
 
             else:
